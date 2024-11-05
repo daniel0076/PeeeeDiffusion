@@ -5,20 +5,23 @@ from torch.utils.data import Dataset, DataLoader
 from diffusers import StableDiffusionPipeline
 from transformers import AutoTokenizer
 from peft import LoraConfig, get_peft_model
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from typing import List, Optional, Union, Dict, Any
 import wandb
+from pathlib import Path
+import yaml
 
 class StableDiffusionDataset(Dataset):
     def __init__(self, image_paths, prompts, tokenizer, image_size=512):
+        self.image_size = image_size
         self.image_paths = image_paths
         self.prompts = prompts
         self.tokenizer = tokenizer
         self.image_transforms = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
+            transforms.Lambda(lambda img: self.resize_and_pad_image(img, (self.image_size, self.image_size))),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5])
         ])
@@ -45,6 +48,21 @@ class StableDiffusionDataset(Dataset):
             "attention_mask": encoded["attention_mask"].squeeze(),
             "prompt": prompt
         }
+    def resize_and_pad_image(self, image, size=(512, 512), fill_color=(0, 0, 0)):
+        # Resize image while maintaining aspect ratio
+        image.thumbnail(size, Image.LANCZOS)
+
+        # Calculate padding to center the image
+        pad_width = size[0] - image.width
+        pad_height = size[1] - image.height
+        padding = (
+            pad_width // 2,
+            pad_height // 2,
+            pad_width - pad_width // 2,
+            pad_height - pad_height // 2,
+        )
+        return ImageOps.expand(image, padding, fill=fill_color)
+
 
 class StableDiffusionLoRA(pl.LightningModule):
     def __init__(
@@ -60,10 +78,11 @@ class StableDiffusionLoRA(pl.LightningModule):
         sample_prompts: Optional[list] = None
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore="sample_prompts")
+        self.save_hyperparameters_to_yaml('checkpoints/hparams.yaml') #change
 
         # Initialize pipeline
-        self.pipeline = StableDiffusionPipeline.from_pretrained(model_id)
+        self.pipeline = StableDiffusionPipeline.from_pretrained(model_id).to("cuda")
         self.vae = self.pipeline.vae
         self.text_encoder = self.pipeline.text_encoder
         # print stable diffusion model architecture
@@ -75,7 +94,7 @@ class StableDiffusionLoRA(pl.LightningModule):
 
         # Setup UNet with custom LoRA
         self.unet = self.pipeline.unet
-        print(self.unet)
+        #print(self.unet)
         #write what it has been printed intofile:
         with open("unet.txt", "w") as file:
             file.write(str(self.unet))
@@ -99,6 +118,9 @@ class StableDiffusionLoRA(pl.LightningModule):
 
         # Store configuration
         self.learning_rate = learning_rate
+        self.lora_config = lora_config
+        self.target_modules = target_modules
+        self.min_val_loss = float("inf")
 
     def get_target_modules(
         self,
@@ -118,7 +140,7 @@ class StableDiffusionLoRA(pl.LightningModule):
             for name, module in model.named_children():
                 full_name = f"{prefix}.{name}" if prefix else name
 
-                if any(t in module.__class__.__name__.lower() for t in ['attention', 'transformer']):
+                if any(t in module.__class__.__name__.lower() for t in ['attention', 'transformer', 'crossattn']):
                     attention_modules.append({
                         'name': full_name,
                         'type': module.__class__.__name__,
@@ -148,6 +170,7 @@ class StableDiffusionLoRA(pl.LightningModule):
 
         target_names = set()
         for mod in attention_modules:
+            # print(f"DEBUG: {mod}")
             module_base = mod['name']
             target_names.update([
                 f"{module_base}.to_q",
@@ -161,7 +184,7 @@ class StableDiffusionLoRA(pl.LightningModule):
     def forward(self, batch):
         latents = self.vae.encode(
             batch["pixel_values"].to(self.device)
-        ).latent_dist.sample() * 0.18215
+        ).latent_dist.sample() * self.vae.config.scaling_factor
 
         text_embeddings = self.text_encoder(
             batch["input_ids"].to(self.device)
@@ -198,6 +221,8 @@ class StableDiffusionLoRA(pl.LightningModule):
         if batch_idx == 0 and self.current_epoch % 10 == 0:
             self.generate_samples()
 
+        self.save_lora_weights("checkpoints/lora_weights.pth") #change
+
         return loss
 
     def generate_samples(self):
@@ -217,13 +242,100 @@ class StableDiffusionLoRA(pl.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.unet.parameters(), lr=self.learning_rate)
+    
+    def save_lora_weights(self, save_path: str):
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        # Get state dict of only the LoRA parameters
+        lora_state_dict = {}
+        for key, value in self.unet.state_dict().items():
+            if "lora" in key:
+                lora_state_dict[key] = value
+        
+        # Save the weights and config
+        torch.save({
+            "lora_state_dict": lora_state_dict,
+            "config": {
+                "target_modules": self.target_modules,
+                "lora_config": self.lora_config,
+            }
+        }, save_path)
+        print(f"Saved LoRA weights to {save_path}")
+
+    def load_lora_weights(self, load_path: str):
+
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f"No file found at {load_path}")
+        
+        # Load the saved weights and config
+        checkpoint = torch.load(load_path)
+        lora_state_dict = checkpoint["lora_state_dict"]
+        
+        # Update the UNet's state dict with the LoRA weights
+        current_state_dict = self.unet.state_dict()
+        current_state_dict.update(lora_state_dict)
+        self.unet.load_state_dict(current_state_dict)
+        
+        print(f"Loaded LoRA weights from {load_path}")
+
+    def apply_to_pipeline(self, pipeline: StableDiffusionPipeline):
+
+        # Get the LoRA state dict
+        lora_state_dict = {}
+        for key, value in self.unet.state_dict().items():
+            if "lora" in key:
+                lora_state_dict[key] = value
+        
+        # Apply LoRA config to the new pipeline's UNet
+        pipeline.unet = get_peft_model(
+            pipeline.unet,
+            self.lora_config
+        )
+        
+        # Load the LoRA weights
+        current_state_dict = pipeline.unet.state_dict()
+        current_state_dict.update(lora_state_dict)
+        pipeline.unet.load_state_dict(current_state_dict)
+        
+        return pipeline
+
+    def save_hyperparameters_to_yaml(self, file_path: str):
+  
+        # Get hyperparameters as dict
+        hparams_dict = dict(self.hparams)
+        
+        # Remove any tensor or non-serializable objects
+        cleaned_hparams = {}
+        for key, value in hparams_dict.items():
+            if isinstance(value, (str, int, float, bool, list, dict)):
+                cleaned_hparams[key] = value
+        
+        # Save to YAML
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, 'w') as f:
+            yaml.dump(cleaned_hparams, f, default_flow_style=False)
+        
+        print(f"Saved hyperparameters to {file_path}")
+
+    @classmethod
+    def load_from_hyperparameters(cls, hparams_file: str, apply_lora: bool = True):
+
+        # Load hyperparameters from YAML
+        with open(hparams_file, 'r') as f:
+            hparams = yaml.safe_load(f)
+        module = cls(**hparams)
+        if apply_lora:
+            module.load_lora_weights("checkpoints/lora_weights.pth")
+        return module
+    
+        
 
 class StableDiffusionDataModule(pl.LightningDataModule):
     def __init__(
         self,
         image_paths: list,
         prompts: list,
-        #tokenizer_id: str = "CompVis/stable-diffusion-v1-4",
         tokenizer_id: str = "openai/clip-vit-large-patch14",
         batch_size: int = 1,
         num_workers: int = 4,
@@ -308,14 +420,32 @@ def main(config):
         accelerator="gpu",
         devices=1,
         max_epochs=config["max_epochs"],
-        callbacks=[checkpoint_callback],
+        callbacks=[],
         logger=wandb_logger,
         precision=16,
-        gradient_clip_val=1.0
+        gradient_clip_val=1.0,
+        enable_checkpointing=False,
     )
 
     # Start training
     trainer.fit(model, data_module)
+
+def load_all_images(folder_path):
+    image_paths = []
+    for root, _, files in os.walk(folder_path):
+        for file in files:
+            if file.endswith(".png") or file.endswith(".jpg"):
+                image_paths.append(os.path.join(root, file))
+    return image_paths
+
+def load_prompts(image_paths, prompt_folder):
+    prompts = []
+    for image_path in image_paths:
+        image_name = Path(image_path).stem
+        prompt_path = Path(prompt_folder) / f"{image_name}.txt"
+        with open(prompt_path, "r") as file:
+            prompts.append(file.read().strip())
+    return prompts
 
 if __name__ == "__main__":
 
@@ -338,7 +468,7 @@ if __name__ == "__main__":
             "target_modules": None
         },
         "end_layers": {
-            "layer_indices": [5, 6, 7],
+            "layer_indices": [-1, -2, -3],
             "layer_types": None,
             "target_modules": None
         }
@@ -347,15 +477,19 @@ if __name__ == "__main__":
     selected_config = "cross_attention_only"
     layer_config = layer_configs[selected_config]
 
+    image_paths = load_all_images("./dataset/Peeee/10_peeee") # Update image folder
+    prompts = load_prompts(image_paths, "./dataset/Peeee/10_peeee") # Update prompt folder
+
     config = {
-        "model_id": "CompVis/stable-diffusion-v1-4",
-        "image_paths": ["./dataset/Peeee/10_peeee/1.png"],  # Update paths
-        "prompts": ["peeee"],     # Update prompts
+        "selected_config": selected_config,
+        "model_id": "Linaqruf/anything-v3.0",
+        "image_paths": image_paths,
+        "prompts": prompts,
         "batch_size": 1,
-        "max_epochs": 100,
+        "max_epochs": 1000,
         "learning_rate": 1e-4,
         "sample_prompts": [
-            "A magical forest at sunset"
+            "peeee, food"
         ],
         **layer_config # Unpack layer configuration
     }
