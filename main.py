@@ -12,7 +12,12 @@ from pytorch_lightning.loggers import WandbLogger
 from typing import List, Optional, Union, Dict, Any
 import wandb
 from pathlib import Path
-import yaml
+import yaml, random
+
+
+backbones_lut = {
+        "stable-diffusion": "CompVis/stable-diffusion-v1-4",
+        "anything": "Linaqruf/anything-v3.0"}
 
 class StableDiffusionDataset(Dataset):
     def __init__(self, image_paths, prompts, tokenizer, image_size=512):
@@ -67,7 +72,7 @@ class StableDiffusionDataset(Dataset):
 class StableDiffusionLoRA(pl.LightningModule):
     def __init__(
         self,
-        model_id: str = "CompVis/stable-diffusion-v1-4",
+        model_id: str = None,
         lora_r: int = 8,
         lora_alpha: int = 32,
         lora_dropout: float = 0.1,
@@ -82,7 +87,7 @@ class StableDiffusionLoRA(pl.LightningModule):
         self.save_hyperparameters_to_yaml('checkpoints/hparams.yaml') #change
 
         # Initialize pipeline
-        self.pipeline = StableDiffusionPipeline.from_pretrained(model_id).to("cuda")
+        self.pipeline = StableDiffusionPipeline.from_pretrained(backbones_lut[model_id]).to("cuda")
         self.vae = self.pipeline.vae
         self.text_encoder = self.pipeline.text_encoder
         # print stable diffusion model architecture
@@ -191,10 +196,17 @@ class StableDiffusionLoRA(pl.LightningModule):
         )[0]
 
         noise = torch.randn_like(latents)
-        timesteps = torch.randint(
-            0, self.pipeline.scheduler.config.num_train_timesteps,
-            (latents.shape[0],), device=self.device
-        )
+        # sample a random number of timesteps to add noise
+        n = random.randint(0, 10)
+        if n < 5:
+            timesteps = torch.randint(0, int(self.pipeline.scheduler.config.num_train_timesteps//5 * 2), (latents.shape[0],), device=self.device)
+        else:
+            timesteps = torch.randint(int(self.pipeline.scheduler.config.num_train_timesteps//5 * 4),  int(self.pipeline.scheduler.config.num_train_timesteps), (latents.shape[0],), device=self.device)
+        
+        # timesteps = torch.randint(
+        #    int( 0.6 * self.pipeline.scheduler.config.num_train_timesteps), int(0.8 * self.pipeline.scheduler.config.num_train_timesteps ),
+        #     (latents.shape[0],), device=self.device
+        # )
         noisy_latents = self.pipeline.scheduler.add_noise(latents, noise, timesteps)
 
         noise_pred = self.unet(
@@ -218,12 +230,11 @@ class StableDiffusionLoRA(pl.LightningModule):
 
         self.log("val_loss", loss, prog_bar=True)
 
-        if batch_idx == 0 and self.current_epoch % 10 == 0:
-            self.generate_samples()
+          
 
-        self.save_lora_weights("checkpoints/lora_weights.pth") #change
-
-        return loss
+    def on_validation_epoch_end(self):
+        self.generate_samples()
+        self.save_lora_weights("checkpoints/lora_weights.pth")
 
     def generate_samples(self):
         self.unet.eval()
@@ -326,7 +337,9 @@ class StableDiffusionLoRA(pl.LightningModule):
             hparams = yaml.safe_load(f)
         module = cls(**hparams)
         if apply_lora:
-            module.load_lora_weights("checkpoints/lora_weights.pth")
+            module.load_lora_weights(
+                os.path.join(hparams_file.replace('hparams.yaml', "lora_weights.pth"))
+                )
         return module
     
         
@@ -338,7 +351,7 @@ class StableDiffusionDataModule(pl.LightningDataModule):
         prompts: list,
         tokenizer_id: str = "openai/clip-vit-large-patch14",
         batch_size: int = 1,
-        num_workers: int = 4,
+        num_workers: int = 0,
         image_size: int = 512
     ):
         super().__init__()
@@ -413,7 +426,10 @@ def main(config):
     )
 
     # Setup logger
-    wandb_logger = WandbLogger(project="sd-lora-lightning")
+    wandb_logger = WandbLogger(
+        project="sd-lora-lightning",
+        name=f"{config['model_id']}",
+        )
 
     # Initialize trainer
     trainer = pl.Trainer(
@@ -425,6 +441,8 @@ def main(config):
         precision=16,
         gradient_clip_val=1.0,
         enable_checkpointing=False,
+        check_val_every_n_epoch=10,
+        accumulate_grad_batches=8,
     )
 
     # Start training
@@ -448,6 +466,8 @@ def load_prompts(image_paths, prompt_folder):
     return prompts
 
 if __name__ == "__main__":
+
+    
 
     layer_configs = {
         "cross_attention_only": {
@@ -482,7 +502,8 @@ if __name__ == "__main__":
 
     config = {
         "selected_config": selected_config,
-        "model_id": "Linaqruf/anything-v3.0",
+        # "model_id": "Linaqruf/anything-v3.0",
+        "model_id": "stable-diffusion",
         "image_paths": image_paths,
         "prompts": prompts,
         "batch_size": 1,

@@ -4,6 +4,7 @@ from diffusers import StableDiffusionPipeline
 from safetensors.torch import load_file
 from pathlib import Path
 from main import StableDiffusionLoRA
+import  os
 #model_id = "CompVis/stable-diffusion-v1-4"
 
 
@@ -17,11 +18,14 @@ module = StableDiffusionLoRA.load_from_hyperparameters('./checkpoints/hparams.ya
 # pipe = pipe.to(device)
 
 # Now generate an image with the fine-tuned model
-prompt = "Peeee, book"
+prompt = "cute, girl, drawing"
 guidance_scales = [5, 7.5, 10]
 for guidance_scale in guidance_scales:
     image = module.pipeline(prompt, num_inference_steps=25, guidance_scale=guidance_scale).images[0]
 
     # Save the generated image
 
-    image.save(''.join(prompt.split(",")) + '_'+ str(guidance_scale)+".png")
+    image.save(
+        os.path.join( 'outputs',
+            ''.join(prompt.split(",")) + '_'+ str(guidance_scale)+".png")
+    )
